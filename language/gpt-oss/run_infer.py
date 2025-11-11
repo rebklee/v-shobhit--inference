@@ -411,6 +411,8 @@ def process_requests(tokenized_df: pd.DataFrame, server_url: str,
 def main():
     parser = argparse.ArgumentParser(
         description="Send pre-tokenized requests to SGLang server")
+    parser.add_argument("--backend", type=str, default="sglang", options=["sglang", "vllm"],
+                        help="Serving backend (default: 'sglang') (options: ['sglang', 'vllm'])"),
     parser.add_argument("--input-tokens", required=True,
                         help="Path to pickle file containing pre-tokenized data from harmony-tokens.py")
     parser.add_argument("--server-url", default="http://localhost:30000",
@@ -436,11 +438,19 @@ def main():
 
     # Test connection
     logger.info(f"Testing server connection to {args.server_url}...")
-    test_client = SGLangClient(
+    if args.backend == "sglang":
+        client_obj = SGLangClient
+    elif args.backend == "vllm":
+        client_obj = VllmClient
+    else:
+        logger.error(f"Invalid backend: {args.backend}")
+        return
+    test_client = client_obj(
         server_url=args.server_url,
         temperature=args.temperature,
         top_k=args.top_k,
         timeout=args.timeout)
+    logger.info(f"Client backend: {args.backend}")
 
     test_response = test_client.send_request(input_ids=[1, 2, 3], max_tokens=5)
     if "error" in test_response:
