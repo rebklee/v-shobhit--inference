@@ -90,6 +90,49 @@ class SGLangClient:
             return {"error": str(e)}
 
 
+class VllmClient:
+    def __init__(self,
+                 server_url: str = "http://localhost:30000",
+                 temperature: float = 0.001,
+                 top_k: int = 1,
+                 timeout: int = 1200
+                 ):
+        self.base_url = server_url
+        self.session = requests.Session()
+        self.temperature = temperature
+        self.top_k = top_k
+        self.timeout = timeout
+
+    def send_request(
+            self, input_ids: List[int], max_tokens: int = 100) -> Dict[str, Any]:
+        """Send a single request to the SGLang server."""
+        # Vllm format with input_ids
+        payload = {
+            "prompt": input_ids,
+            "max_tokens": max_tokens,
+            "temperature": self.temperature,
+            "top_k": self.top_k,
+            "return_token_ids": True,
+        }
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/v1/completions",
+                json=payload,
+                timeout=self.timeout,
+            )
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(
+                    f"Request failed with status {response.status_code}: {response.text}")
+                return {"error": f"HTTP {response.status_code}: {response.text}"}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed: {e}")
+            return {"error": str(e)}
+
+
+
 def load_tokenized_data(data_file: str) -> pd.DataFrame:
     """Load pre-tokenized data from pickle file produced by harmony-tokens.py."""
     logger.info(f"Loading tokenized data from {data_file}")
@@ -128,10 +171,17 @@ def load_tokenized_data(data_file: str) -> pd.DataFrame:
 
 def send_single_request(args_tuple):
     """Send a single request - used by multiprocessing pool."""
-    input_ids, max_tokens, server_url, sample_id, pass_num, temperature, top_k, timeout = args_tuple
+    input_ids, max_tokens, server_url, sample_id, pass_num, temperature, top_k, timeout, backend = args_tuple
 
     # Create a new client for this process
-    client = SGLangClient(
+    if backend == "sglang":
+        client_obj = SGLangClient
+    elif backend == "vllm":
+        client_obj = VllmClient
+    else:
+        logger.error(f"Invalid backend: {backend}")
+        return
+    client = client_obj(
         server_url=server_url,
         temperature=temperature,
         top_k=top_k,
@@ -152,7 +202,7 @@ def send_single_request(args_tuple):
 
 def send_requests_parallel(tokenized_df: pd.DataFrame, server_url: str,
                            max_tokens: int = 100, max_concurrency: int = 128, temperature: float = 0.001, top_k: int = 1, timeout: int = 1200,
-                           pass_k: int = 1):
+                           pass_k: int = 1, backend: str = 'sglang'):
     """Send all requests to SGLang server in parallel using multiprocessing.
 
     Args:
@@ -172,7 +222,7 @@ def send_requests_parallel(tokenized_df: pd.DataFrame, server_url: str,
         for pass_num in range(pass_k):
             args_list.append((
                 row['tok_input'], max_tokens, server_url,
-                idx, pass_num, temperature, top_k, timeout
+                idx, pass_num, temperature, top_k, timeout, backend
             ))
 
     start_time = time.time()
@@ -211,7 +261,7 @@ def send_requests_parallel(tokenized_df: pd.DataFrame, server_url: str,
 
 
 def extract_response_ids(
-        responses_by_pass: Dict[tuple, Dict[str, Any]], tokenized_df: pd.DataFrame, pass_k: int) -> Dict[tuple, List[int]]:
+        responses_by_pass: Dict[tuple, Dict[str, Any]], tokenized_df: pd.DataFrame, pass_k: int, backend: str) -> Dict[tuple, List[int]]:
     """Extract response output_ids from SGLang responses for all passes.
 
     Args:
@@ -232,14 +282,20 @@ def extract_response_ids(
             for pass_num in range(pass_k):
                 response = responses_by_pass.get((idx, pass_num), {})
                 response_id = []
-                if "error" not in response and "output_ids" in response:
+                if "error" not in response and ("output_ids" in response or "choices" in response):
                     try:
                         # SGLang returns the generated token IDs in the
                         # 'output_ids' field
-                        response_id = response["output_ids"]
+                        if backend == 'sglang':
+                            response_id = response["output_ids"]
+                        elif backend == 'vllm':
+                            response_id = response["choices"][0]["token_ids"]
+                        else:
+                            logger.error(f"Invalid backend: {backend}")
                     except Exception as e:
                         logger.warning(
                             f"Failed to extract response for sample {idx}, pass {pass_num}: {e}")
+                # logger.info(f"\n\n>>>> Extracted response_id = {response_id}\n\n")
                 response_ids_by_pass[(idx, pass_num)] = response_id
                 pbar.update(1)
 
@@ -364,7 +420,7 @@ def save_responses(responses_by_pass: Dict[tuple, Dict[str, Any]],
 def process_requests(tokenized_df: pd.DataFrame, server_url: str,
                      max_samples: int = None, max_tokens: int = 100,
                      max_concurrency: int = 128, output_file: str = None, temperature: float = 0.001, top_k: int = 1,
-                     timeout: int = 1200, pass_k: int = 1) -> pd.DataFrame:
+                     timeout: int = 1200, pass_k: int = 1, backend: str = 'sglang') -> pd.DataFrame:
     """Main processing function that handles requests and response extraction.
 
     Args:
@@ -385,11 +441,12 @@ def process_requests(tokenized_df: pd.DataFrame, server_url: str,
         temperature,
         top_k,
         timeout,
-        pass_k)
+        pass_k,
+        backend)
 
     # Step 3: Extract response output_ids for all passes
     response_ids_by_pass = extract_response_ids(
-        responses_by_pass, tokenized_df, pass_k)
+        responses_by_pass, tokenized_df, pass_k, backend)
 
     # Step 4: Detokenize output_ids to text for model_output for all passes
     detokenized_texts_by_pass = detokenize_output_ids(
@@ -411,8 +468,8 @@ def process_requests(tokenized_df: pd.DataFrame, server_url: str,
 def main():
     parser = argparse.ArgumentParser(
         description="Send pre-tokenized requests to SGLang server")
-    parser.add_argument("--backend", type=str, default="sglang", options=["sglang", "vllm"],
-                        help="Serving backend (default: 'sglang') (options: ['sglang', 'vllm'])"),
+    parser.add_argument("--backend", type=str, default="sglang", choices=["sglang", "vllm"],
+                        help="Serving backend (default: 'sglang') (choices: ['sglang', 'vllm'])"),
     parser.add_argument("--input-tokens", required=True,
                         help="Path to pickle file containing pre-tokenized data from harmony-tokens.py")
     parser.add_argument("--server-url", default="http://localhost:30000",
@@ -473,7 +530,8 @@ def main():
                                  temperature=args.temperature,
                                  top_k=args.top_k,
                                  timeout=args.timeout,
-                                 pass_k=args.pass_k)
+                                 pass_k=args.pass_k,
+                                 backend=args.backend)
 
     # Print summary
     logger.info(f"\nProcessing completed:")
